@@ -1,0 +1,4 @@
+Controller,Avg Attempts / Incident,First-Attempt Success Rate (%),Repeated Unsuccessful Rate (%),Mean MTTR (seconds),Toxic Collateral Events,Prevented Unnecessary Actions,Memory Precision (%)
+Baseline A (Fixed Rule),2.2,0.0,51.5,23.0,24,0,0.0
+Baseline B (Positive-Only),1.78,23.3,40.2,16.8,13,0,0.0
+Proposed (Negative Memory),1.07,95.0,0.0,6.0,2,33,100.0
