@@ -15,8 +15,39 @@ import sqlite3
 import json
 import os
 import uuid
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Tuple, Optional
+
+from src.paths import DEFAULT_DB_PATH, ensure_parent_dir, resolve_path
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Decay / confidence policy constants
+# ---------------------------------------------------------------------------
+# A *neutral* failure (action failed but caused no collateral damage) starts
+# with moderate confidence and forgets at a baseline rate. A *toxic* failure
+# (action caused catastrophic collateral damage) starts with higher confidence
+# and decays proportionally slower so that destructive actions are protected
+# for longer. The toxic/neutral ratio is preserved from the original research
+# methodology (0.015 / 0.05 = 0.3).
+DEFAULT_NEUTRAL_CONFIDENCE: float = 0.86
+DEFAULT_NEUTRAL_DECAY: float = 0.05
+DEFAULT_TOXIC_CONFIDENCE: float = 0.98
+DEFAULT_TOXIC_DECAY: float = 0.015
+TOXIC_DECAY_FACTOR: float = DEFAULT_TOXIC_DECAY / DEFAULT_NEUTRAL_DECAY  # 0.3
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Coerces ``value`` to a finite float, returning ``default`` on failure."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(result) or math.isinf(result):
+        return default
+    return result
 
 
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
@@ -37,29 +68,34 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return float(max(-1.0, min(1.0, sim)))
 
 
-def normalize_context(raw: Dict[str, float]) -> List[float]:
+def normalize_context(raw: Optional[Dict[str, float]]) -> List[float]:
     """
     Normalizes observed cloud operating telemetry into a 5-dimensional state vector:
     V_state = [CPU_Usage, Memory_Usage, DB_Connections, Network_Latency, Error_Rate]
     Each dimension is normalized to the range [0.0, 1.0].
+
+    Non-numeric, missing, or non-finite inputs are treated as 0.0 rather than
+    raising, so malformed telemetry can never crash the healing loop.
     """
-    # CPU: 0 - 100% -> [0.0, 1.0]
-    cpu = max(0.0, min(1.0, raw.get("cpu", 0.0) / 100.0 if raw.get("cpu", 0.0) > 1.0 else raw.get("cpu", 0.0)))
-    
-    # Memory: 0 - 100% -> [0.0, 1.0]
-    mem = max(0.0, min(1.0, raw.get("mem", 0.0) / 100.0 if raw.get("mem", 0.0) > 1.0 else raw.get("mem", 0.0)))
-    
-    # DB Connections: 0 - 100% (or pool percentage) -> [0.0, 1.0]
-    db_conn = max(0.0, min(1.0, raw.get("db_conn", 0.0) / 100.0 if raw.get("db_conn", 0.0) > 1.0 else raw.get("db_conn", 0.0)))
-    
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _pct(key: str) -> float:
+        # Accept either a 0-1 fraction or a 0-100 percentage.
+        val = _safe_float(raw.get(key, 0.0), 0.0)
+        return max(0.0, min(1.0, val / 100.0 if val > 1.0 else val))
+
+    # CPU / Memory / DB connections are percentage-like metrics.
+    cpu = _pct("cpu")
+    mem = _pct("mem")
+    db_conn = _pct("db_conn")
+
     # Network Latency: assume nominal max ~1000ms -> [0.0, 1.0]
-    lat_raw = raw.get("latency_ms", 0.0)
+    lat_raw = _safe_float(raw.get("latency_ms", 0.0), 0.0)
     latency = max(0.0, min(1.0, lat_raw / 1000.0 if lat_raw > 1.0 else lat_raw))
-    
+
     # Error Rate: 0 - 1.0 (or 0 - 100%) -> [0.0, 1.0]
-    err_raw = raw.get("error_rate", 0.0)
-    error_rate = max(0.0, min(1.0, err_raw / 100.0 if err_raw > 1.0 else err_raw))
-    
+    error_rate = _pct("error_rate")
+
     return [round(cpu, 4), round(mem, 4), round(db_conn, 4), round(latency, 4), round(error_rate, 4)]
 
 
@@ -88,9 +124,33 @@ class NegativeConstraint:
         """
         Computes active confidence C(t) using Ebbinghaus exponential decay:
         C(t) = C0 * exp(-lambda * max(0, t - t0))
+
+        This is the single source of truth for confidence used by both the
+        filtering engine and the dashboard display.
         """
-        delta_t = max(0.0, current_time - self.timestamp)
+        delta_t = max(0.0, _safe_float(current_time, 0.0) - self.timestamp)
         return float(self.initial_confidence * math.exp(-self.decay_lambda * delta_t))
+
+    def is_active(self, current_time: float, theta_conf: float = 0.40) -> bool:
+        """True while the constraint confidence is at/above the threshold."""
+        return self.get_decayed_confidence(current_time) >= theta_conf
+
+    def get_decay_info(self, current_time: float, theta_conf: float = 0.40) -> Dict[str, Any]:
+        """
+        Returns a consistent snapshot of the decay state for a given time.
+        Used by the UI so displayed confidence and active/expired status are
+        computed exactly the same way as the blocking decision.
+        """
+        delta_t = max(0.0, _safe_float(current_time, 0.0) - self.timestamp)
+        confidence = self.get_decayed_confidence(current_time)
+        return {
+            "initial_confidence": self.initial_confidence,
+            "decay_lambda": self.decay_lambda,
+            "elapsed": round(delta_t, 4),
+            "decayed_confidence": round(confidence, 6),
+            "theta_conf": theta_conf,
+            "is_active": confidence >= theta_conf,
+        }
 
 
 @dataclass
@@ -116,93 +176,131 @@ class RemediationMemoryEngine:
     and candidate action filtering with explainable diagnostic outputs.
     """
 
-    def __init__(self, db_path: Optional[str] = "outputs/remediation_memory.db", in_memory_only: bool = False):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = DEFAULT_DB_PATH, in_memory_only: bool = False):
+        self.db_path = resolve_path(db_path) if db_path else db_path
         self.in_memory_only = in_memory_only
         self.negative_memory: List[NegativeConstraint] = []
         self.positive_memory: List[PositiveOutcome] = []
-        
+        self.last_error: Optional[str] = None
+
         if not self.in_memory_only and self.db_path:
-            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
-            self._init_sqlite()
-            self._load_sqlite()
+            try:
+                ensure_parent_dir(self.db_path)
+                self._init_sqlite()
+                self._load_sqlite()
+            except sqlite3.Error as exc:
+                # Keep the engine usable in-memory even if persistence fails.
+                self.last_error = f"SQLite initialization failed: {exc}"
+                logger.exception("Failed to initialize remediation memory database at %s", self.db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        """Opens a connection with sensible concurrency defaults."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
     def _init_sqlite(self):
-        """Initializes SQLite database tables for persistence."""
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS negative_constraints (
-                record_id TEXT PRIMARY KEY,
-                failure_condition TEXT,
-                observed_context_raw TEXT,
-                observed_context_vector TEXT,
-                action TEXT,
-                result TEXT,
-                verification_evidence TEXT,
-                failure_reason TEXT,
-                negative_constraint TEXT,
-                toxicity TEXT,
-                initial_confidence REAL,
-                decay_lambda REAL,
-                timestamp REAL
+        """Initializes SQLite database tables for persistence (idempotent)."""
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS negative_constraints (
+                    record_id TEXT PRIMARY KEY,
+                    failure_condition TEXT,
+                    observed_context_raw TEXT,
+                    observed_context_vector TEXT,
+                    action TEXT,
+                    result TEXT,
+                    verification_evidence TEXT,
+                    failure_reason TEXT,
+                    negative_constraint TEXT,
+                    toxicity TEXT,
+                    initial_confidence REAL,
+                    decay_lambda REAL,
+                    timestamp REAL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS positive_outcomes (
+                    record_id TEXT PRIMARY KEY,
+                    failure_condition TEXT,
+                    observed_context_raw TEXT,
+                    observed_context_vector TEXT,
+                    action TEXT,
+                    result TEXT,
+                    verification_evidence TEXT,
+                    timestamp REAL
+                )
+            """)
+            # Safe, additive schema migration: older databases created before
+            # these columns existed are upgraded without dropping any data.
+            self._ensure_column(cur, "negative_constraints", "failure_reason", "TEXT")
+            self._ensure_column(cur, "negative_constraints", "negative_constraint", "TEXT")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_neg_condition_action "
+                "ON negative_constraints(failure_condition, action)"
             )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS positive_outcomes (
-                record_id TEXT PRIMARY KEY,
-                failure_condition TEXT,
-                observed_context_raw TEXT,
-                observed_context_vector TEXT,
-                action TEXT,
-                result TEXT,
-                verification_evidence TEXT,
-                timestamp REAL
-            )
-        """)
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ensure_column(cur: sqlite3.Cursor, table: str, column: str, decl: str) -> None:
+        """Adds a column only if it is missing (non-destructive migration)."""
+        existing = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _load_sqlite(self):
         """Loads records from SQLite into memory."""
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        
-        cur.execute("SELECT record_id, failure_condition, observed_context_raw, observed_context_vector, action, result, verification_evidence, failure_reason, negative_constraint, toxicity, initial_confidence, decay_lambda, timestamp FROM negative_constraints")
-        rows = cur.fetchall()
-        self.negative_memory = []
-        for r in rows:
-            self.negative_memory.append(NegativeConstraint(
-                record_id=r[0],
-                failure_condition=r[1],
-                observed_context_raw=json.loads(r[2]),
-                observed_context_vector=json.loads(r[3]),
-                action=r[4],
-                result=r[5],
-                verification_evidence=r[6],
-                failure_reason=r[7],
-                negative_constraint=r[8],
-                toxicity=r[9],
-                initial_confidence=float(r[10]),
-                decay_lambda=float(r[11]),
-                timestamp=float(r[12])
-            ))
-            
-        cur.execute("SELECT record_id, failure_condition, observed_context_raw, observed_context_vector, action, result, verification_evidence, timestamp FROM positive_outcomes")
-        rows = cur.fetchall()
-        self.positive_memory = []
-        for r in rows:
-            self.positive_memory.append(PositiveOutcome(
-                record_id=r[0],
-                failure_condition=r[1],
-                observed_context_raw=json.loads(r[2]),
-                observed_context_vector=json.loads(r[3]),
-                action=r[4],
-                result=r[5],
-                verification_evidence=r[6],
-                timestamp=float(r[7])
-            ))
-        conn.close()
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+
+            cur.execute("SELECT record_id, failure_condition, observed_context_raw, observed_context_vector, action, result, verification_evidence, failure_reason, negative_constraint, toxicity, initial_confidence, decay_lambda, timestamp FROM negative_constraints")
+            rows = cur.fetchall()
+            self.negative_memory = []
+            for r in rows:
+                try:
+                    self.negative_memory.append(NegativeConstraint(
+                        record_id=r[0],
+                        failure_condition=r[1],
+                        observed_context_raw=json.loads(r[2]),
+                        observed_context_vector=json.loads(r[3]),
+                        action=r[4],
+                        result=r[5],
+                        verification_evidence=r[6],
+                        failure_reason=r[7],
+                        negative_constraint=r[8],
+                        toxicity=r[9],
+                        initial_confidence=float(r[10]),
+                        decay_lambda=float(r[11]),
+                        timestamp=float(r[12])
+                    ))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    logger.warning("Skipping corrupt negative constraint row %r", r[0])
+
+            cur.execute("SELECT record_id, failure_condition, observed_context_raw, observed_context_vector, action, result, verification_evidence, timestamp FROM positive_outcomes")
+            rows = cur.fetchall()
+            self.positive_memory = []
+            for r in rows:
+                try:
+                    self.positive_memory.append(PositiveOutcome(
+                        record_id=r[0],
+                        failure_condition=r[1],
+                        observed_context_raw=json.loads(r[2]),
+                        observed_context_vector=json.loads(r[3]),
+                        action=r[4],
+                        result=r[5],
+                        verification_evidence=r[6],
+                        timestamp=float(r[7])
+                    ))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    logger.warning("Skipping corrupt positive outcome row %r", r[0])
+        finally:
+            conn.close()
 
     def record_negative_constraint(
         self,
@@ -221,25 +319,37 @@ class RemediationMemoryEngine:
     ) -> NegativeConstraint:
         """
         Creates and stores a verified negative constraint.
-        Applies default parameters:
-        - Neutral Failure: C0 = 0.86, lambda = 0.05
-        - Toxic Failure: C0 = 0.98, lambda = 0.015
+
+        Decay policy (documented, consistent):
+        - ``decay_lambda`` is the *base* decay constant supplied by the caller
+          (e.g. the dashboard slider). It governs newly created NEUTRAL
+          constraints.
+        - If ``decay_lambda`` is omitted, the research default (0.05) is used.
+        - TOXIC constraints always decay ``TOXIC_DECAY_FACTOR`` times slower
+          than the base rate, preserving the original prolonged-protection
+          semantics (0.015 / 0.05 = 0.3).
+        - Existing constraints are never retroactively changed; each stores its
+          own ``decay_lambda`` at creation time. Changing the slider therefore
+          affects only *new* constraints, which keeps historical confidence
+          reproducible.
         """
         if record_id is None:
             record_id = str(uuid.uuid4())[:8]
 
-        toxicity_upper = toxicity.upper()
+        # Base decay rate for this constraint (neutral baseline).
+        base_decay = _safe_float(decay_lambda, DEFAULT_NEUTRAL_DECAY) if decay_lambda is not None else DEFAULT_NEUTRAL_DECAY
+        base_decay = max(1e-6, base_decay)
+
+        toxicity_upper = str(toxicity).upper()
         if toxicity_upper == "TOXIC":
             if initial_confidence is None:
-                initial_confidence = 0.98
-            if decay_lambda is None:
-                decay_lambda = 0.015
+                initial_confidence = DEFAULT_TOXIC_CONFIDENCE
+            decay_lambda = base_decay * TOXIC_DECAY_FACTOR
         else:
             toxicity_upper = "NEUTRAL"
             if initial_confidence is None:
-                initial_confidence = 0.86
-            if decay_lambda is None:
-                decay_lambda = 0.05
+                initial_confidence = DEFAULT_NEUTRAL_CONFIDENCE
+            decay_lambda = base_decay
 
         constraint = NegativeConstraint(
             record_id=record_id,
@@ -260,27 +370,33 @@ class RemediationMemoryEngine:
         self.negative_memory.append(constraint)
 
         if not self.in_memory_only and self.db_path:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT OR REPLACE INTO negative_constraints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                constraint.record_id,
-                constraint.failure_condition,
-                json.dumps(constraint.observed_context_raw),
-                json.dumps(constraint.observed_context_vector),
-                constraint.action,
-                constraint.result,
-                constraint.verification_evidence,
-                constraint.failure_reason,
-                constraint.negative_constraint,
-                constraint.toxicity,
-                constraint.initial_confidence,
-                constraint.decay_lambda,
-                constraint.timestamp
-            ))
-            conn.commit()
-            conn.close()
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT OR REPLACE INTO negative_constraints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        constraint.record_id,
+                        constraint.failure_condition,
+                        json.dumps(constraint.observed_context_raw),
+                        json.dumps(constraint.observed_context_vector),
+                        constraint.action,
+                        constraint.result,
+                        constraint.verification_evidence,
+                        constraint.failure_reason,
+                        constraint.negative_constraint,
+                        constraint.toxicity,
+                        constraint.initial_confidence,
+                        constraint.decay_lambda,
+                        constraint.timestamp
+                    ))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                self.last_error = f"Failed to persist negative constraint: {exc}"
+                logger.exception("Failed to persist negative constraint %s", constraint.record_id)
 
         return constraint
 
@@ -314,22 +430,28 @@ class RemediationMemoryEngine:
         self.positive_memory.append(outcome)
 
         if not self.in_memory_only and self.db_path:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT OR REPLACE INTO positive_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                outcome.record_id,
-                outcome.failure_condition,
-                json.dumps(outcome.observed_context_raw),
-                json.dumps(outcome.observed_context_vector),
-                outcome.action,
-                outcome.result,
-                outcome.verification_evidence,
-                outcome.timestamp
-            ))
-            conn.commit()
-            conn.close()
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT OR REPLACE INTO positive_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        outcome.record_id,
+                        outcome.failure_condition,
+                        json.dumps(outcome.observed_context_raw),
+                        json.dumps(outcome.observed_context_vector),
+                        outcome.action,
+                        outcome.result,
+                        outcome.verification_evidence,
+                        outcome.timestamp
+                    ))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                self.last_error = f"Failed to persist positive outcome: {exc}"
+                logger.exception("Failed to persist positive outcome %s", outcome.record_id)
 
         return outcome
 
@@ -413,13 +535,25 @@ class RemediationMemoryEngine:
         return ranked
 
     def clear_memory(self):
-        """Clears in-memory lists and wipes SQLite database tables."""
+        """
+        Clears only the *learned remediation memory* (negative constraints and
+        positive outcomes) from both RAM and SQLite.
+
+        Incident execution history, benchmark artifacts, and any other tables
+        in the shared database are deliberately preserved.
+        """
         self.negative_memory.clear()
         self.positive_memory.clear()
         if not self.in_memory_only and self.db_path and os.path.exists(self.db_path):
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM negative_constraints")
-            cur.execute("DELETE FROM positive_outcomes")
-            conn.commit()
-            conn.close()
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM negative_constraints")
+                    cur.execute("DELETE FROM positive_outcomes")
+                    conn.commit()
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                self.last_error = f"Failed to clear remediation memory: {exc}"
+                logger.exception("Failed to clear remediation memory at %s", self.db_path)

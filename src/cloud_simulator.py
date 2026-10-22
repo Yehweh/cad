@@ -101,6 +101,20 @@ class CloudEnvironmentSimulator:
 
         return raw, vector, candidates
 
+    def is_action_effective(self, condition: str, action: str, raw_context: Optional[Dict[str, float]] = None) -> bool:
+        """
+        Pure, side-effect-free probe of whether ``action`` would restore health
+        for ``condition`` under the current environment configuration.
+
+        Uses a throwaway simulator instance so the caller's state (and the live
+        environment) is never mutated. Used to validate that blocked actions
+        would genuinely have failed (memory precision).
+        """
+        probe = CloudEnvironmentSimulator(seed=None)
+        probe.patch_db_conn_exhaustion_fixed = self.patch_db_conn_exhaustion_fixed
+        result = probe.execute_and_verify(condition, action, raw_context or {})
+        return result.is_healthy
+
     def execute_and_verify(self, condition: str, action: str, raw_context: Dict[str, float]) -> HealthCheckResult:
         """
         Executes a remediation action against the simulated cloud environment and

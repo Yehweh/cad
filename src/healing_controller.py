@@ -231,12 +231,16 @@ class ProposedNegativeMemoryController:
         simulator: CloudEnvironmentSimulator,
         memory_engine: Optional[RemediationMemoryEngine] = None,
         theta_sim: float = 0.85,
-        theta_conf: float = 0.40
+        theta_conf: float = 0.40,
+        decay_lambda: float = 0.05
     ):
         self.simulator = simulator
         self.memory_engine = memory_engine or RemediationMemoryEngine(in_memory_only=True)
         self.theta_sim = theta_sim
         self.theta_conf = theta_conf
+        # Base decay constant applied to newly recorded NEUTRAL constraints.
+        # Existing constraints keep the lambda they were created with.
+        self.decay_lambda = decay_lambda
         self.name = "Proposed (Negative+Positive Memory)"
         self.history: List[IncidentExecutionRecord] = []
         self.prevented_actions_count = 0
@@ -336,6 +340,7 @@ class ProposedNegativeMemoryController:
                     failure_reason=result.failure_reason,
                     negative_constraint=constraint_text,
                     toxicity=result.toxicity,
+                    decay_lambda=self.decay_lambda,
                     timestamp=timestamp
                 )
 

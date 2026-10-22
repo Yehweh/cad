@@ -1,0 +1,15 @@
+# Streamlit configuration for the CAD self-healing dashboard.
+#
+# NOTE: No [theme] section is defined on purpose. Pinning `base = "dark"`
+# (as an earlier revision did) removed the ability to switch themes. With no
+# theme pinned, Streamlit defaults to "Use system setting", so the app follows
+# the OS/browser `prefers-color-scheme` out of the box.
+#
+# The in-app theme selector (sidebar) switches between System Default / Light /
+# Dark. Explicit Light/Dark overrides are applied through Streamlit's own
+# client-side theme preference (see src/theme.py) plus theme-aware CSS for the
+# dashboard's custom components. Streamlit 1.66 does not expose a Python API to
+# change the native theme at runtime; the in-app selector reflects that.
+
+[browser]
+gatherUsageStats = false
